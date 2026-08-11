@@ -36,21 +36,149 @@ os.environ["HF_HUB_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["DIFFUSERS_VERBOSITY"] = "error"
-os.environ["HF_HOME"] = "/content/hf_cache"
-os.environ["HF_LEROBOT_HOME"] = "/content/lerobot_cache"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# ============================================================
+# ★★★ PREP_ONLY モード（CPU ランタイムでダウンロードのみ実行）★★★
+# ============================================================
+#
+# True  : CPU ランタイムでも動くように、GPU チェックを緩和
+#         Cell 7.5 まで実行してキャッシュを作成し、Drive に保存して終了
+#         Cell 8 以降は実行しない前提
+#
+# False : GPU (A100/L4/T4) で通常実行、学習まで実施
+#
+# CPU ランタイム設定: ランタイム → ランタイムのタイプを変更 →
+#                    ハードウェアアクセラレータ = None
+# ============================================================
+PREP_ONLY = False  # ★★★ CPU で DL 準備するときは True にする ★★★
+
+# Colab 環境なら Python の厳密なバージョンチェックを緩和して警告のみ出す
+IN_COLAB = False
+try:
+    import google.colab  # type: ignore
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+
 if sys.version_info < (3, 12):
-    raise RuntimeError("Python 3.12以上が必要です。")
+    if IN_COLAB:
+        print(
+            "[WARN] Colab の Python が 3.12 未満です。動かない機能があるかもしれませんが継続します."
+        )
+    else:
+        raise RuntimeError("Python 3.12以上が必要です。")
 
-if not torch.cuda.is_available():
-    raise RuntimeError("GPUランタイムを選択してください。")
-
-print(f"GPU: {torch.cuda.get_device_name(0)}")
+if PREP_ONLY:
+    print(">>> PREP_ONLY モード: CPU ランタイムで DL 準備のみ実施")
+    if torch.cuda.is_available():
+        print(f"    (GPU 検出: {torch.cuda.get_device_name(0)} — CPU 相当で処理)")
+    else:
+        print(f"    (GPU なし — 想定通り)")
+else:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "GPUランタイムを選択してください。"
+            "PREP_ONLY=True にすれば CPU でも動作します。"
+        )
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 # ## 2. システムパッケージを準備する
 # 
 # LeRobot、動画デコード、MuJoCoで必要になるパッケージを導入します。
+# ## 1.5. Google Drive をマウントし、永続キャッシュを設定する
+try:
+    from google.colab import drive as _colab_drive
+    import shutil as _shutil
+
+    DRIVE_MOUNTPOINT = Path("/content/drive")
+    if not (DRIVE_MOUNTPOINT / "MyDrive").is_dir():
+        _colab_drive.mount(str(DRIVE_MOUNTPOINT))
+
+    # 永続キャッシュ（Drive 上）
+    DRIVE_CACHE_ROOT = DRIVE_MOUNTPOINT / "MyDrive" / "parc2026_cache"
+    DRIVE_HF_CACHE = DRIVE_CACHE_ROOT / "hf"
+    DRIVE_LEROBOT_CACHE = DRIVE_CACHE_ROOT / "lerobot"
+    DRIVE_HF_CACHE.mkdir(parents=True, exist_ok=True)
+    DRIVE_LEROBOT_CACHE.mkdir(parents=True, exist_ok=True)
+
+    # 高速キャッシュ（/content 上）
+    LOCAL_HF_CACHE = Path("/content/hf_cache")
+    LOCAL_LEROBOT_CACHE = Path("/content/lerobot_cache")
+    LOCAL_HF_CACHE.mkdir(parents=True, exist_ok=True)
+    LOCAL_LEROBOT_CACHE.mkdir(parents=True, exist_ok=True)
+
+    os.environ["HF_HOME"] = str(LOCAL_HF_CACHE)
+    os.environ["HF_LEROBOT_HOME"] = str(LOCAL_LEROBOT_CACHE)
+
+    # 完了マーカー（DL が確実に終わった証明）
+    CACHE_MARKER = DRIVE_CACHE_ROOT / "download_complete.txt"
+
+    usage = _shutil.disk_usage(str(DRIVE_MOUNTPOINT / "MyDrive"))
+    free_gb = usage.free / (1024 ** 3)
+    print(f"[Drive] free = {free_gb:.1f} GB")
+
+    if free_gb < 5.0:
+        print(f"[WARN] Drive 残 {free_gb:.1f} GB は Spatial (4GB) にもギリギリ")
+        print("       Google One 100GB (¥290/月) 加入を強く推奨")
+    elif free_gb < 20.0:
+        print(f"[OK] Drive 残 {free_gb:.1f} GB: Spatial+Object は保存可能、FULL は不可")
+    else:
+        print(f"[OK] Drive 残 {free_gb:.1f} GB: FULL データセットも保存可能")
+
+
+    def restore_cache_from_drive():
+        import time as _time
+        if not CACHE_MARKER.exists():
+            print("[Restore] マーカー無し。Drive にキャッシュが確実な形で無いのでスキップ")
+            return False
+
+        for src, dst, label in [
+            (DRIVE_HF_CACHE, LOCAL_HF_CACHE, "hf_cache"),
+            (DRIVE_LEROBOT_CACHE, LOCAL_LEROBOT_CACHE, "lerobot_cache"),
+        ]:
+            if not any(src.iterdir()):
+                continue
+            t0 = _time.time()
+            print(f"[Restore] {label}: Drive → /content 復元中...", flush=True)
+            subprocess.run(
+                ["rsync", "-a", f"{src}/", f"{dst}/"],
+                check=False,
+            )
+            print(f"[Restore] {label}: 完了 ({_time.time() - t0:.0f}s)", flush=True)
+        return True
+
+
+    def save_cache_to_drive():
+        import time as _time
+        for src, dst, label in [
+            (LOCAL_HF_CACHE, DRIVE_HF_CACHE, "hf_cache"),
+            (LOCAL_LEROBOT_CACHE, DRIVE_LEROBOT_CACHE, "lerobot_cache"),
+        ]:
+            if not any(src.iterdir()):
+                continue
+            t0 = _time.time()
+            print(f"[Save] {label}: /content → Drive 保存中...", flush=True)
+            subprocess.run(
+                ["rsync", "-a", f"{src}/", f"{dst}/"],
+                check=False,
+            )
+            print(f"[Save] {label}: 完了 ({_time.time() - t0:.0f}s)", flush=True)
+
+        # マーカーを最後に書く（途中失敗したら restore がスキップされる）
+        CACHE_MARKER.write_text(f"completed at {_time.time()}")
+        print(f"[Save] マーカー書込 → 次回セッションで復元可能")
+
+
+    # 復元試行（初回は何も起きない）
+    restored = restore_cache_from_drive()
+    if not restored:
+        print(">>> 初回セッション or マーカー無し。Cell 7.5 で DL 発生")
+    else:
+        print(">>> キャッシュ復元完了。Cell 7.5 は即完了する見込み")
+except Exception:
+    # 非 Colab 環境では google.colab が import できず、ここはスキップされる
+    pass
 def run_quiet(
     command: list[str],
     *,
